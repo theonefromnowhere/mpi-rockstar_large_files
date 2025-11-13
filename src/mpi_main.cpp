@@ -53,6 +53,11 @@ double time_start;
 #endif
 
 
+#if (MPI_VERSION >= 4)
+    #define ROCKSTAR_USE_MPI_LARGE_COUNT 1
+#endif
+
+
 int64_t accumulate(int64_t n){
 
   int64_t n_total = 0;
@@ -133,6 +138,52 @@ int64_t exchange_data(const T send_data[], int counts[], T *&recv_data,
     return num_to_recv;
 }
 
+
+
+#ifdef ROCKSTAR_USE_MPI_LARGE_COUNT
+//An exchange_data function with MPI_Count counts to avoid overflows for very large data exchanges
+template <typename T>
+int64_t exchange_data(const T send_data[], const MPI_Count counts[], T *&recv_data,
+                      const int recv_offset, MPI_Datatype mpi_data_type) {
+
+
+    //Now using MPI_Count as it is an long long int type inside, thus resists the overflows
+    auto recv_counts_c = allocate<MPI_Count>(NUM_WRITERS);
+    MPI_Alltoall(counts, 1, MPI_COUNT, recv_counts_c, 1, MPI_COUNT, MPI_COMM_WORLD);
+    
+    auto send_displs_aint = allocate<MPI_Aint>(NUM_WRITERS);
+    auto recv_displs_aint = allocate<MPI_Aint>(NUM_WRITERS);
+
+    //Aint and Count are different types, so we need temporary arrays to convert between them
+    auto temp_send_counts_aint = allocate<MPI_Aint>(NUM_WRITERS);
+    auto temp_recv_counts_aint = allocate<MPI_Aint>(NUM_WRITERS);
+    for (int i = 0; i < NUM_WRITERS; ++i) {
+        temp_send_counts_aint[i] = counts[i];
+        temp_recv_counts_aint[i] = recv_counts_c[i];
+    }
+
+    calc_displs(temp_send_counts_aint, NUM_WRITERS, send_displs_aint);
+    uint64_t total_to_recv = calc_displs(temp_recv_counts_aint, NUM_WRITERS, recv_displs_aint);
+
+    // allocating receive buffer
+    recv_data = reallocate(recv_data, recv_offset + total_to_recv);
+
+    // This function is not supported by some of the backends. MPICH works.
+    MPI_Alltoallv_c(send_data, counts, send_displs_aint, mpi_data_type,
+                    recv_data + recv_offset, recv_counts_c, recv_displs_aint,
+                    mpi_data_type, MPI_COMM_WORLD);
+
+    // cleaning up
+    recv_counts_c = reallocate(recv_counts_c, 0);
+    send_displs_aint = reallocate(send_displs_aint, 0);
+    recv_displs_aint = reallocate(recv_displs_aint, 0);
+    temp_send_counts_aint = reallocate(temp_send_counts_aint, 0);
+    temp_recv_counts_aint = reallocate(temp_recv_counts_aint, 0);
+
+    return total_to_recv;
+}
+
+#endif
 
 
 void createDivision( const int n, int *ndiv){
@@ -662,73 +713,135 @@ MPI_Datatype create_mpi_eparticle_type() {
 }
 
 
+
 void transfer_particles(int my_reader_rank, float *my_reader_bounds,
                         float (*writer_bounds)[6]) {
-    auto send_counts = allocate<int>(NUM_WRITERS);
-    clear_counts(send_counts, NUM_WRITERS);
     struct particle *send_buffer = nullptr;
 
+    // This logic only runs on reader ranks that have particles
     if (my_reader_rank != -1) {
+
         std::vector<int64_t> recipients;
         for (int64_t i = 0; i < NUM_WRITERS; i++) {
             float bounds[6];
-            //if (bounds_overlap(my_reader_bounds, writer_bounds[i], bounds, 0)) {
-	    if (bounds_overlap(my_reader_bounds, writer_bounds[i], bounds, FORCE_RES)) {
+            if (bounds_overlap(my_reader_bounds, writer_bounds[i], bounds, FORCE_RES)) {
                 recipients.emplace_back(i);
             }
         }
 
         auto dest_procs = allocate<int64_t>(num_p);
-#if 0
+#pragma omp parallel for
         for (int64_t i = 0; i < num_p; i++) {
             for (auto j : recipients) {
                 if (_check_bounds_raw(p[i].pos, writer_bounds[j])) {
                     dest_procs[i] = j;
-                    ++send_counts[j];
                     break;
                 }
             }
+        }
+
+
+#ifdef ROCKSTAR_USE_MPI_LARGE_COUNT
+        // ---- 64-BIT OVERFLOW-SAFE PATH (for MPI >= 4.0) ----
+        {
+            auto send_counts_c = allocate<MPI_Count>(NUM_WRITERS);
+            clear_counts(send_counts_c, NUM_WRITERS);
+            for (int64_t i = 0; i < num_p; i++) {
+                send_counts_c[dest_procs[i]]++;
+            }
+
+            // Temporary array because calc_displs needs MPI_Count[]
+            auto send_displs_temp = allocate<MPI_Count>(NUM_WRITERS);
+            uint64_t num_to_send = calc_displs(send_counts_c, NUM_WRITERS, send_displs_temp);
+
+            // Now convert to MPI_Aint[]
+            auto send_displs_aint = allocate<MPI_Aint>(NUM_WRITERS);
+            for (int i = 0; i < NUM_WRITERS; ++i) send_displs_aint[i] = send_displs_temp[i];
+            send_displs_temp = reallocate(send_displs_temp, 0);
+
+            printf("num_to_send=%" PRIu64 " num_p=%" PRId64 "\n", num_to_send, num_p);
+            assert(num_to_send == num_p);
+            send_buffer = allocate<struct particle>(num_to_send);
+
+            for (int64_t i = 0; i < num_p; i++) {
+                send_buffer[send_displs_aint[dest_procs[i]]++] = p[i];
+            }
+
+            p = reallocate(p, 0); num_p = 0; // Free memory early
+            timed_output("Transferring0...\n");
+
+            auto mpi_particle_type = create_mpi_particle_type();
+            num_p = exchange_data(send_buffer, send_counts_c, p, 0, mpi_particle_type);
+            MPI_Type_free(&mpi_particle_type);
+
+            send_counts_c = reallocate(send_counts_c, 0);
+            send_displs_aint = reallocate(send_displs_aint, 0);
         }
 #else
-#pragma omp parallel for
-	for (int64_t i = 0; i < num_p; i++) {
-            for (auto j : recipients) {
-                if (_check_bounds_raw(p[i].pos, writer_bounds[j])) {
-                    dest_procs[i] = j;
-                    break;
-                }
+        // ---- 32-BIT FALLBACK PATH (for MPI < 4.0) ----
+        {
+            auto send_counts = allocate<int>(NUM_WRITERS);
+            clear_counts(send_counts, NUM_WRITERS);
+            for (int64_t i = 0; i < num_p; i++) {
+                // This is where it overflows.
+                send_counts[dest_procs[i]]++;
             }
-        }
 
-	for (int64_t i = 0; i < num_p; i++){
-	  send_counts[dest_procs[i]] ++;
-	}
+            auto send_displs = allocate<int>(NUM_WRITERS);
+            uint64_t num_to_send = calc_displs(send_counts, NUM_WRITERS, send_displs);
+
+            printf("num_to_send=%" PRIu64 " num_p=%" PRId64 "\n", num_to_send, num_p);
+            assert(num_to_send == num_p);
+            send_buffer = allocate<struct particle>(num_to_send);
+
+            for (int64_t i = 0; i < num_p; i++) {
+                send_buffer[send_displs[dest_procs[i]]++] = p[i];
+            }
+
+            p = reallocate(p, 0); num_p = 0; // Free memory early
+            timed_output("Transferring0...\n");
+
+            auto mpi_particle_type = create_mpi_particle_type();
+            num_p = exchange_data(send_buffer, send_counts, p, 0, mpi_particle_type);
+            MPI_Type_free(&mpi_particle_type);
+
+            send_counts = reallocate(send_counts, 0);
+            send_displs = reallocate(send_displs, 0);
+        }
 #endif
-        std::vector<int64_t>().swap(recipients);
 
-        auto send_displs = allocate<int>(NUM_WRITERS);
-        auto num_to_send = calc_displs(send_counts, NUM_WRITERS, send_displs);
-        assert(num_to_send == num_p);
-        send_buffer = allocate<struct particle>(num_to_send);
+        // Cleanup for variables common to both paths
+        dest_procs = reallocate(dest_procs, 0);
 
-        for (int64_t i = 0; i < num_p; i++) {
-            send_buffer[send_displs[dest_procs[i]]++] = p[i];
-        }
-        send_displs = reallocate(send_displs, 0);
-        dest_procs  = reallocate(dest_procs, 0);
+    } else {
+
+        p = reallocate(p, 0); num_p = 0;
+        timed_output("Transferring0...\n");
+
+        // Non-reader ranks just receive data
+#ifdef ROCKSTAR_USE_MPI_LARGE_COUNT
+        auto send_counts_c = allocate<MPI_Count>(NUM_WRITERS);
+        clear_counts(send_counts_c, NUM_WRITERS);
+        auto mpi_particle_type = create_mpi_particle_type();
+        num_p = exchange_data(p, send_counts_c, p, 0, mpi_particle_type);
+        MPI_Type_free(&mpi_particle_type);
+        send_counts_c = reallocate(send_counts_c, 0);
+#else
+        auto send_counts = allocate<int>(NUM_WRITERS);
+        clear_counts(send_counts, NUM_WRITERS);
+        auto mpi_particle_type = create_mpi_particle_type();
+        num_p = exchange_data(p, send_counts, p, 0, mpi_particle_type);
+        MPI_Type_free(&mpi_particle_type);
+        send_counts = reallocate(send_counts, 0);
+#endif
     }
-    p     = reallocate(p, 0);
-    num_p = 0;
-    timed_output("Transferring0...\n");
 
-    auto mpi_particle_type = create_mpi_particle_type();
-    num_p = exchange_data(send_buffer, send_counts, p, 0, mpi_particle_type);
-    MPI_Type_free(&mpi_particle_type);
+    // Free send buffer
     send_buffer = reallocate(send_buffer, 0);
-    send_counts = reallocate(send_counts, 0);
-
     timed_output("Transferring particles to writers...\n");
 }
+
+
 
 void transfer_particles_mem_save(int my_reader_rank, float *my_reader_bounds,
                                  float (*writer_bounds)[6]) {
